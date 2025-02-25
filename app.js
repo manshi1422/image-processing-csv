@@ -1,83 +1,3 @@
-// const fs = require('fs');
-// const csv = require('fast-csv');
-// const axios = require('axios');
-// const sharp = require('sharp');
-// const path = require('path');
-
-// // Define paths for input and output CSV files
-// const inputCsvPath = './Book1.csv';
-// const outputCsvPath = './Book2.csv';
-
-// // Directory to save processed images
-// const outputImagesDir = './processed_images';
-// if (!fs.existsSync(outputImagesDir)) {
-//     fs.mkdirSync(outputImagesDir);
-// }
-
-// // Dummy image processing function using sharp (e.g., resize)
-// async function processImage(imageUrl, productName, index) {
-//     try {
-//         // Download image data
-//         const response = await axios({
-//             url: imageUrl,
-//             responseType: 'arraybuffer',
-//         });
-//         const imageBuffer = Buffer.from(response.data, 'binary');
-
-//         // Process the image using sharp
-//         const processedBuffer = await sharp(imageBuffer)
-//             .resize(200) // Example resize to width 200px
-//             .toBuffer();
-
-//         // Save the processed image locally (for demonstration)
-//         // You can later upload to cloud storage if needed.
-//         const outputFileName = `${productName.replace(/\s+/g, '_')}_${index}.jpg`;
-//         const outputFilePath = path.join(outputImagesDir, outputFileName);
-//         fs.writeFileSync(outputFilePath, processedBuffer);
-
-//         // For demonstration, return a file path or a hosted URL
-//         return outputFilePath;
-//     } catch (err) {
-//         console.error(`Error processing image ${imageUrl}:`, err);
-//         return null;
-//     }
-// }
-
-// // Process the CSV file
-// async function processCSV() {
-//     const rows = [];
-//     // Read input CSV
-//     fs.createReadStream(inputCsvPath)
-//         .pipe(csv.parse({ headers: true }))
-//         .on('error', error => console.error(error))
-//         .on('data', row => rows.push(row))
-//         .on('end', async rowCount => {
-//             console.log(`Parsed ${rowCount} rows`);
-//             // Process each row sequentially or concurrently as needed
-//             for (let row of rows) {
-//                 const serialNumber = row['Serial Number'];
-//                 const productName = row['Product Name'];
-//                 const inputUrls = row['Input Image Urls'].split(',').map(url => url.trim());
-
-//                 // Process each image and obtain output URL
-//                 const outputUrls = [];
-//                 for (let i = 0; i < inputUrls.length; i++) {
-//                     const outputUrl = await processImage(inputUrls[i], productName, i);
-//                     outputUrls.push(outputUrl);
-//                 }
-
-//                 // Add output URLs as comma separated string in the row
-//                 row['Output Image Urls'] = outputUrls.join(',');
-//             }
-
-//             // Write results to the output CSV file
-//             const ws = fs.createWriteStream(outputCsvPath);
-//             csv.write(rows, { headers: true }).pipe(ws);
-//             console.log('CSV processing completed. Output file:', outputCsvPath);
-//         });
-// }
-
-// processCSV();
 // server.js
 import express from 'express';
 import multer from 'multer';
@@ -86,7 +6,18 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import sharp from 'sharp';
+import mongoose from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
+import Job from './models/Job.js';
+
+// MongoDB connection
+const MONGODB_URI = 'mongodb://localhost:27017/csv-processing'; // update as needed
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log('MongoDB connected'))
+.catch(err => console.error('MongoDB connection error:', err));
 
 // Create directories if they do not exist
 const uploadsDir = path.join(process.cwd(), 'uploads');
@@ -116,7 +47,7 @@ async function processImage(imageUrl, productName, index) {
     const outputFilePath = path.join(outputDir, outputFileName);
     fs.writeFileSync(outputFilePath, processedBuffer);
 
-    // Return the output file path or URL (for demo, we return the local path)
+    // Return the output file path (or URL)
     return outputFilePath;
   } catch (err) {
     console.error(`Error processing image ${imageUrl}:`, err.message);
@@ -125,108 +56,103 @@ async function processImage(imageUrl, productName, index) {
 }
 
 // Process CSV file: read input, process images, and write output CSV.
-async function processCsvFile(filePath, job) {
+async function processCsvFile(filePath, jobDoc) {
   try {
     const rows = [];
-    fs.createReadStream(filePath)
+    const stream = fs.createReadStream(filePath)
       .pipe(csv.parse({ headers: true }))
       .on('error', error => {
         console.error('CSV Parsing Error:', error);
-        job.status = 'failed';
+        jobDoc.status = 'failed';
+        jobDoc.errorMessage = error.message;
+        jobDoc.save();
       })
       .on('data', row => {
-        // Basic CSV header validation (adjust as needed)
-        if (!row['S. No.'] || !row['Product Name'] || !row['Input Image Urls']) {
-          job.status = 'failed';
-          console.error('CSV Format Error: Missing required columns.');
+        // Validate required columns
+        if (!row['Serial Number'] || !row['Product Name'] || !row['Input Image Urls']) {
+          jobDoc.status = 'failed';
+          jobDoc.errorMessage = 'Missing required columns in CSV.';
+          jobDoc.save();
+          stream.destroy(); // Stop further processing
           return;
         }
         rows.push(row);
       })
       .on('end', async rowCount => {
-        if (job.status === 'failed') return;
-        job.totalRows = rows.length;
-        job.processedRows = 0;
-        // Process each CSV row
+        // Update total rows
+        jobDoc.totalRows = rows.length;
+        await jobDoc.save();
+
         for (let row of rows) {
-          const serialNumber = row['Serial Number'];
           const productName = row['Product Name'];
-          // Split comma-separated URLs and trim each one
           const inputUrls = row['Input Image Urls'].split(',').map(url => url.trim());
           const outputUrls = [];
 
-          // Process each image URL sequentially (or consider parallel processing)
           for (let i = 0; i < inputUrls.length; i++) {
             const outUrl = await processImage(inputUrls[i], productName, i);
             outputUrls.push(outUrl || '');
           }
-
-          // Add the output image URLs (comma separated) to the row
           row['Output Image Urls'] = outputUrls.join(',');
-          job.processedRows++;
+          jobDoc.processedRows++;
+          await jobDoc.save();
         }
-        // Write the updated CSV with a new column for output image URLs
-        const outputFilePath = path.join(outputDir, `${job.requestId}.csv`);
+
+        const outputFilePath = path.join(outputDir, `${jobDoc.requestId}.csv`);
         const ws = fs.createWriteStream(outputFilePath);
         csv.write(rows, { headers: true }).pipe(ws);
-        job.outputFile = outputFilePath;
-        job.status = 'completed';
+
+        jobDoc.outputFile = outputFilePath;
+        jobDoc.status = 'completed';
+        await jobDoc.save();
       });
   } catch (err) {
     console.error('Error processing CSV:', err);
-    job.status = 'failed';
+    jobDoc.status = 'failed';
+    jobDoc.errorMessage = err.message;
+    await jobDoc.save();
   }
 }
 
-// In-memory job store (in production, use a database)
-const jobStore = {};
-
-// Configure Express and multer for file uploads
+// Setup Express and multer for file uploads
 const app = express();
 const upload = multer({ dest: uploadsDir });
 const PORT = process.env.PORT || 3000;
 
 // Upload API Endpoint
-app.post('/api/upload', upload.single('file'), (req, res) => {
-  // Validate file exists and has a .csv extension
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file || !req.file.originalname.endsWith('.csv')) {
     return res.status(400).json({ error: 'Invalid file format. Please upload a CSV file.' });
   }
 
-  // Generate unique request ID and create a job record
+  // Generate unique request ID and create a new Job document
   const requestId = uuidv4();
-  jobStore[requestId] = {
-    requestId,
-    status: 'processing',
-    processedRows: 0,
-    totalRows: 0,
-    outputFile: null,
-  };
+  const jobDoc = new Job({ requestId });
+  await jobDoc.save();
 
-  // Start CSV processing in the background
-  processCsvFile(req.file.path, jobStore[requestId]);
+  // Start CSV processing asynchronously
+  processCsvFile(req.file.path, jobDoc);
 
-  // Return the request ID to the client
+  // Return the request ID
   res.json({ requestId });
 });
 
 // Status API Endpoint
-app.get('/api/status/:requestId', (req, res) => {
+app.get('/api/status/:requestId', async (req, res) => {
   const { requestId } = req.params;
-  const job = jobStore[requestId];
-  if (!job) {
+  const jobDoc = await Job.findOne({ requestId });
+  if (!jobDoc) {
     return res.status(404).json({ error: 'Job not found' });
   }
   res.json({
-    requestId: job.requestId,
-    status: job.status,
-    processedRows: job.processedRows,
-    totalRows: job.totalRows,
-    outputFile: job.outputFile, // In production, you might provide a download URL
+    requestId: jobDoc.requestId,
+    status: jobDoc.status,
+    processedRows: jobDoc.processedRows,
+    totalRows: jobDoc.totalRows,
+    outputFile: jobDoc.outputFile,
+    errorMessage: jobDoc.errorMessage,
   });
 });
 
-// Start the server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
